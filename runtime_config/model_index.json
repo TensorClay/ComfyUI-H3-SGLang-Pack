@@ -1,0 +1,5 @@
+{
+  "_class_name": "ComfyUIMiniMaxH3ExternalPipeline",
+  "_diffusers_version": "0.32.2",
+  "transformer": ["diffusers", "MiniMaxH3DiTModel"]
+}

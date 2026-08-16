@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check Python syntax
+        run: python -m compileall -q .
+      - name: Validate Registry metadata
+        run: |
+          python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          metadata = tomllib.loads(Path("pyproject.toml").read_text())
+          assert metadata["project"]["name"] == "h3-sglang-pack"
+          assert metadata["tool"]["comfy"]["PublisherId"] == "tensorclay"
+          assert "TensorClay/ComfyUI-H3-SGLang-Pack" in metadata["project"]["urls"]["Repository"]
+          PY

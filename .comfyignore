@@ -1,0 +1,7 @@
+.git/
+.github/
+tests/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage

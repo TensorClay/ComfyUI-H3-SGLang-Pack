@@ -1,0 +1,16 @@
+{
+  "_class_name": "MiniMaxH3Pipeline",
+  "_diffusers_version": "0.32.2",
+  "scheduler": null,
+  "transformer": ["diffusers", "MiniMaxH3DiTModel"],
+  "_minimax_h3": {
+    "schema_version": 1,
+    "partition": "ref2va",
+    "tasks": ["ref2va"],
+    "task_aliases": {},
+    "sigma_shift_scales": {
+      "video": 12.0,
+      "audio": 3.0
+    }
+  }
+}

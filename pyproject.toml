@@ -1,0 +1,26 @@
+[project]
+name = "h3-sglang-pack"
+version = "0.1.0"
+description = "SGLang-backed ComfyUI nodes for distributed MiniMax H3 Ref2VA denoising."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = []
+authors = [
+    { name = "TensorClay" },
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Video",
+]
+
+[project.urls]
+Repository = "https://github.com/TensorClay/ComfyUI-H3-SGLang-Pack"
+Documentation = "https://github.com/TensorClay/ComfyUI-H3-SGLang-Pack#readme"
+"Bug Tracker" = "https://github.com/TensorClay/ComfyUI-H3-SGLang-Pack/issues"
+
+[tool.comfy]
+PublisherId = "tensorclay"
+DisplayName = "H3 SGLang Pack"
+requires-comfyui = ">=0.32.0"
