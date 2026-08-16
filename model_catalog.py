@@ -20,6 +20,7 @@ H3_SIGNATURE_KEYS = frozenset(
 COMFY_INT8_CONVROT = "comfy_int8_convrot"
 COMFY_BF16 = "comfy_bf16"
 SUPPORTED_FORMATS = frozenset({COMFY_INT8_CONVROT, COMFY_BF16})
+SUPPORTED_VARIANTS = frozenset({"fl2va", "ref2va"})
 
 FULL_BF16_SIGNATURE = {
     "time_embedder.proj_in.weight": ((5376, 256), "F32"),
@@ -37,6 +38,7 @@ class H3Checkpoint:
     variant: str
     size: int
     mtime_ns: int
+    parameter_keys: tuple[str, ...]
 
 
 def _folder_paths():
@@ -45,8 +47,21 @@ def _folder_paths():
     return folder_paths
 
 
+def _variant_from_path(path: Path) -> str:
+    name = path.name.lower()
+    matches = [variant for variant in SUPPORTED_VARIANTS if variant in name]
+    if len(matches) != 1:
+        raise ValueError(
+            "MiniMax H3 checkpoint filename must identify exactly one model "
+            "variant: fl2va or ref2va"
+        )
+    return matches[0]
+
+
 @lru_cache(maxsize=64)
-def _inspect_cached(path_string: str, size: int, mtime_ns: int) -> tuple[str, str]:
+def _inspect_cached(
+    path_string: str, size: int, mtime_ns: int
+) -> tuple[str, str, tuple[str, ...]]:
     del size, mtime_ns
     path = Path(path_string)
     with safe_open(path, framework="pt", device="cpu") as checkpoint:
@@ -102,17 +117,21 @@ def _inspect_cached(path_string: str, size: int, mtime_ns: int) -> tuple[str, st
                     raise ValueError(f"{name} is not {expected_dtype}")
             checkpoint_format = COMFY_BF16
 
-    # H3 checkpoint tensors do not encode the pipeline variant. The current
-    # product is explicitly Ref2VA-only, so compatible local files are loaded
-    # against the pinned Ref2VA pipeline configuration.
-    return checkpoint_format, "ref2va"
+    parameter_keys = tuple(
+        sorted(
+            name
+            for name in keys
+            if name.endswith((".weight", ".bias"))
+        )
+    )
+    return checkpoint_format, _variant_from_path(path), parameter_keys
 
 
 def inspect_checkpoint(name: str) -> H3Checkpoint:
     folders = _folder_paths()
     path = Path(folders.get_full_path_or_raise("diffusion_models", name)).resolve()
     stat = path.stat()
-    checkpoint_format, variant = _inspect_cached(
+    checkpoint_format, variant, parameter_keys = _inspect_cached(
         str(path), stat.st_size, stat.st_mtime_ns
     )
     return H3Checkpoint(
@@ -122,6 +141,7 @@ def inspect_checkpoint(name: str) -> H3Checkpoint:
         variant=variant,
         size=stat.st_size,
         mtime_ns=stat.st_mtime_ns,
+        parameter_keys=parameter_keys,
     )
 
 

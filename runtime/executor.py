@@ -1,30 +1,61 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import logging
 import threading
 import uuid
 
 import torch
 
+from comfy import patcher_extension
+import comfy.ldm.common_dit
+from comfy.ldm.minimax.model import MiniMaxH3Model
+
 from .protocol import (
     CONTRACT_VERSION,
     ExecutionSignature,
+    sanitize_keyframes,
     sanitize_refs,
     unpack_outputs,
 )
 
 
 LOGGER = logging.getLogger(__name__)
+CACHE_DIT_OPTION = "sglang_h3_cache_dit"
+LORAS_OPTION = "sglang_h3_loras"
 
 
 def _cpu(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().to(device="cpu").contiguous()
 
 
-class H3SGLangExecutor(torch.nn.Module):
-    def __init__(self, runtime) -> None:
+class _RemoteH3Attention(torch.nn.Module):
+    pass
+
+
+class _RemoteH3Block(torch.nn.Module):
+    def __init__(self) -> None:
         super().__init__()
+        self.attn = _RemoteH3Attention()
+
+
+def _block_count(parameter_keys: tuple[str, ...]) -> int:
+    indices = []
+    for key in parameter_keys:
+        parts = key.split(".", 2)
+        if len(parts) > 1 and parts[0] == "blocks" and parts[1].isdigit():
+            indices.append(int(parts[1]))
+    return max(indices, default=49) + 1
+
+
+class H3SGLangExecutor(MiniMaxH3Model):
+    def __init__(self, runtime, parameter_keys: tuple[str, ...] = ()) -> None:
+        torch.nn.Module.__init__(self)
+        self.blocks = torch.nn.ModuleList(
+            _RemoteH3Block() for _ in range(_block_count(parameter_keys))
+        )
         self.runtime = runtime
+        self._parameter_keys = parameter_keys
         self.dtype = torch.bfloat16
         self._execution_id: str | None = None
         self._signature: ExecutionSignature | None = None
@@ -32,6 +63,17 @@ class H3SGLangExecutor(torch.nn.Module):
         self._last_sigma: float | None = None
         self._call_index = 0
         self._lock = threading.RLock()
+
+    def state_dict(
+        self, *args, destination=None, prefix="", keep_vars=False
+    ):
+        if destination is None:
+            destination = OrderedDict()
+            destination._metadata = OrderedDict()
+        placeholder = torch.empty(0)
+        for key in self._parameter_keys:
+            destination[prefix + key] = placeholder
+        return destination
 
     def preprocess_text_embeds(self, context: torch.Tensor) -> torch.Tensor:
         if context.ndim != 3 or context.shape[-1] not in (5120, 5376):
@@ -55,11 +97,19 @@ class H3SGLangExecutor(torch.nn.Module):
                 "ControlNet-style control tensors are not yet supported by "
                 "the MiniMax H3 SGLang executor"
             )
-        dit_patches = transformer_options.get("patches_replace", {}).get("dit", {})
-        if dit_patches:
+        if transformer_options.get("optimized_attention_override") is not None:
             raise NotImplementedError(
-                "DiT patches_replace is not yet supported by the distributed "
-                "MiniMax H3 executor"
+                "ComfyUI attention override callbacks cannot run in SGLang worker "
+                "processes; use this pack's MiniMax H3 attention patch nodes"
+            )
+        if transformer_options.get("patches"):
+            raise NotImplementedError(
+                "ComfyUI transformer patches cannot run in SGLang worker processes"
+            )
+        if any(transformer_options.get("patches_replace", {}).values()):
+            raise NotImplementedError(
+                "ComfyUI transformer replacement patches cannot run in SGLang "
+                "worker processes"
             )
 
     def _finish_execution(self) -> None:
@@ -89,12 +139,16 @@ class H3SGLangExecutor(torch.nn.Module):
     ) -> None:
         self._finish_execution()
         execution_id = str(uuid.uuid4())
+        self.runtime.configure_loras(
+            transformer_options.get(LORAS_OPTION, [])
+        )
         video_shape = tuple(int(value) for value in video.shape)
         audio_shape = tuple(int(value) for value in audio.shape)
         begin = {
             "contract_version": CONTRACT_VERSION,
             "action": "begin_execution",
             "execution_id": execution_id,
+            "model_variant": self.runtime.model_variant,
             "context": _cpu(context),
             "text_token_tags": _cpu(payload["text_token_tags"]),
             "cond_video_latents": [
@@ -104,6 +158,11 @@ class H3SGLangExecutor(torch.nn.Module):
                 _cpu(value) for value in payload.get("cond_audio_latents", [])
             ],
             "refs": sanitize_refs(payload.get("refs", [])),
+            "keyframes": sanitize_keyframes(
+                payload.get("keyframes", []),
+                payload.get("frame_count"),
+            ),
+            "frame_count": payload.get("frame_count"),
             "video_shape": video_shape,
             "audio_shape": audio_shape,
             "seed": int(payload.get("seed", 0)),
@@ -120,6 +179,11 @@ class H3SGLangExecutor(torch.nn.Module):
                 transformer_options.get("minimax_h3_sigma_shift_audio", 3.0)
             ),
             "audio_scale": float(payload.get("audio_scale", 1.0)),
+            "cache_dit": transformer_options.get(CACHE_DIT_OPTION),
+            "num_inference_steps": max(
+                1,
+                int(transformer_options["sample_sigmas"].numel()) - 1,
+            ),
         }
         self.runtime.send(begin, video_shape)
         self._execution_id = execution_id
@@ -129,6 +193,34 @@ class H3SGLangExecutor(torch.nn.Module):
         self._call_index = 0
 
     def forward(
+        self,
+        x,
+        timestep,
+        context,
+        control=None,
+        transformer_options=None,
+        minimax_payload=None,
+        **kwargs,
+    ):
+        transformer_options = transformer_options or {}
+        return patcher_extension.WrapperExecutor.new_class_executor(
+            self._forward,
+            self,
+            patcher_extension.get_all_wrappers(
+                patcher_extension.WrappersMP.DIFFUSION_MODEL,
+                transformer_options,
+            ),
+        ).execute(
+            x,
+            timestep,
+            context,
+            control=control,
+            transformer_options=transformer_options,
+            minimax_payload=minimax_payload,
+            **kwargs,
+        )
+
+    def _forward(
         self,
         x,
         timestep,
@@ -150,10 +242,18 @@ class H3SGLangExecutor(torch.nn.Module):
         if "text_token_tags" not in minimax_payload:
             raise ValueError("MiniMax H3 text token tags are required")
         video, audio = x
-        sigma = float((timestep.detach().flatten()[0].float() / 1000.0).cpu())
+        if video.shape[0] != 1 or audio.shape[0] != 1:
+            raise ValueError("MiniMax H3 supports batch size 1")
+        original_video_shape = tuple(int(value) for value in video.shape)
         signature = ExecutionSignature.from_inputs(
-            context, video, audio, minimax_payload
+            context,
+            video,
+            audio,
+            minimax_payload,
+            transformer_options,
         )
+        video = comfy.ldm.common_dit.pad_to_patch_size(video, (1, 2, 2))
+        sigma = float((timestep.detach().flatten()[0].float() / 1000.0).cpu())
 
         with self._lock:
             is_new = (
@@ -182,7 +282,11 @@ class H3SGLangExecutor(torch.nn.Module):
                 "video_x": _cpu(video),
                 "audio_x_carried": _cpu(audio),
             }
-            output = self.runtime.send(evaluate, tuple(video.shape))
+            try:
+                output = self.runtime.send(evaluate, tuple(video.shape))
+            except Exception:
+                self._finish_execution()
+                raise
             if not torch.is_tensor(output.noise_pred):
                 raise RuntimeError("SGLang H3 executor returned no tensor")
             video_out, audio_out = unpack_outputs(
@@ -192,6 +296,13 @@ class H3SGLangExecutor(torch.nn.Module):
             )
             self._last_sigma = sigma
             self._call_index += 1
+            video_out = video_out[
+                :,
+                :,
+                : original_video_shape[2],
+                : original_video_shape[3],
+                : original_video_shape[4],
+            ]
             return [
                 video_out.to(device=video.device, dtype=video.dtype),
                 audio_out.to(device=audio.device, dtype=audio.dtype),

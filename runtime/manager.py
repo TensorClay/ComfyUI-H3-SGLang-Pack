@@ -25,6 +25,7 @@ class RuntimeKey:
     checkpoint_mtime_ns: int
     model_variant: str
     topology: str
+    parameter_keys: tuple[str, ...] = ()
 
     @property
     def parallelism(self) -> tuple[int, int]:
@@ -52,7 +53,6 @@ class RuntimeManager:
         tp_size, ulysses_degree = key.parallelism
         with self._lock:
             if self._bundle is not None and self._bundle.key == key:
-                self._bundle.runtime.start()
                 return self._bundle
             self._shutdown_locked()
             runtime = H3SGLangRuntime(
@@ -62,14 +62,15 @@ class RuntimeManager:
                 model_variant=key.model_variant,
                 tp_size=tp_size,
                 ulysses_degree=ulysses_degree,
+                attention_backend="auto",
             )
             try:
-                runtime.start()
-                executor = H3SGLangExecutor(runtime)
+                executor = H3SGLangExecutor(runtime, key.parameter_keys)
                 model = create_comfyui_model(
                     executor,
                     runtime,
                     self.release,
+                    (key.checkpoint_size + tp_size - 1) // tp_size,
                 )
             except BaseException:
                 runtime.shutdown()
@@ -86,6 +87,14 @@ class RuntimeManager:
             except Exception:
                 LOGGER.exception("MiniMax H3 SGLang runtime cleanup failed")
 
+    def unload(self) -> None:
+        with self._lock:
+            if self._bundle is None:
+                return
+            try:
+                self._bundle.close()
+            except Exception:
+                LOGGER.exception("MiniMax H3 SGLang runtime cleanup failed")
 
     def _shutdown_locked(self) -> None:
         if self._bundle is None:

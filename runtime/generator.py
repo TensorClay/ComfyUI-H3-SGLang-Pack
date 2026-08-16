@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from copy import deepcopy
 import importlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -11,6 +12,9 @@ import tempfile
 import threading
 import uuid
 
+from safetensors.torch import save_file
+
+from .attention import sol_attention_provider
 from .protocol import CONTRACT_VERSION, PIPELINE_NAME
 
 
@@ -61,6 +65,7 @@ class H3SGLangRuntime:
         model_variant: str,
         tp_size: int,
         ulysses_degree: int,
+        attention_backend: str,
     ) -> None:
         self.model_path = model_path
         self.transformer_weights_path = transformer_weights_path
@@ -68,7 +73,10 @@ class H3SGLangRuntime:
         self.model_variant = model_variant
         self.tp_size = tp_size
         self.ulysses_degree = ulysses_degree
+        self.attention_backend = attention_backend
+        self.attention_options = {}
         self.generator = None
+        self._active_loras: tuple[tuple[str, float], ...] = ()
         self._templates = {}
         self._lock = threading.RLock()
         self._temporary_directory = tempfile.TemporaryDirectory(
@@ -81,6 +89,10 @@ class H3SGLangRuntime:
     def topology(self) -> str:
         return f"TP{self.tp_size}/Ulysses{self.ulysses_degree}"
 
+    @property
+    def is_running(self) -> bool:
+        return self.generator is not None
+
     def _ensure_envelope_image(self) -> Path:
         expected = base64.b64decode(ENVELOPE_PNG)
         if (
@@ -90,6 +102,26 @@ class H3SGLangRuntime:
             self._envelope_image.write_bytes(expected)
         return self._envelope_image
 
+    def set_attention_backend(
+        self,
+        attention_backend: str,
+        attention_options: dict | None = None,
+    ) -> None:
+        if attention_backend not in {"auto", "fa", "sage_attn", "sol_attn"}:
+            raise ValueError(
+                f"unsupported SGLang attention backend: {attention_backend!r}"
+            )
+        options = dict(attention_options or {})
+        with self._lock:
+            if (
+                attention_backend == self.attention_backend
+                and options == self.attention_options
+            ):
+                return
+            self.shutdown()
+            self.attention_backend = attention_backend
+            self.attention_options = options
+
     def start(self) -> None:
         with self._lock:
             if self.generator is not None:
@@ -97,6 +129,23 @@ class H3SGLangRuntime:
             os.environ["COMFYUI_SGLANG_H3_CHECKPOINT_FORMAT"] = (
                 self.checkpoint_format
             )
+            os.environ["COMFYUI_SGLANG_H3_ATTENTION_BACKEND"] = (
+                self.attention_backend
+            )
+            os.environ["COMFYUI_SGLANG_H3_ATTENTION_OPTIONS"] = json.dumps(
+                self.attention_options,
+                sort_keys=True,
+            )
+            if self.attention_backend == "sol_attn":
+                provider = sol_attention_provider()
+                if provider is None:
+                    raise RuntimeError(
+                        "Sol Attention requires ComfyUI-SolAttn_triton in "
+                        "ComfyUI/custom_nodes"
+                    )
+                os.environ["COMFYUI_SGLANG_H3_SOL_PROVIDER"] = str(provider)
+            else:
+                os.environ.pop("COMFYUI_SGLANG_H3_SOL_PROVIDER", None)
             configure_worker_discovery()
             from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import (
                 DiffGenerator,
@@ -117,11 +166,54 @@ class H3SGLangRuntime:
                 ulysses_degree=self.ulysses_degree,
                 ring_degree=1,
                 performance_mode="speed",
+                attention_backend=(
+                    None
+                    if self.attention_backend == "auto"
+                    else (
+                        "fa"
+                        if self.attention_backend in {"sage_attn", "sol_attn"}
+                        else self.attention_backend
+                    )
+                ),
                 enable_torch_compile=False,
                 warmup_mode="off",
                 comfyui_mode=True,
             )
             LOGGER.info("MiniMax H3 SGLang runtime ready: %s", self.topology)
+
+    def materialize_lora(self, tensors: dict[str, torch.Tensor]) -> str:
+        path = self._temp_dir / f"comfy_lora_{uuid.uuid4().hex}.safetensors"
+        save_file(tensors, path)
+        return str(path)
+
+    def configure_loras(self, loras: list[dict]) -> None:
+        desired = tuple(
+            (str(lora["path"]), float(lora["strength"]))
+            for lora in loras
+        )
+        self.start()
+        with self._lock:
+            if desired == self._active_loras:
+                return
+            if not desired:
+                if self._active_loras:
+                    self.generator.unmerge_lora_weights(target="transformer")
+                self._active_loras = ()
+                return
+            try:
+                self.generator.set_lora(
+                    lora_nickname=[
+                        f"comfyui_h3_{index}" for index in range(len(desired))
+                    ],
+                    lora_path=[path for path, _ in desired],
+                    target=["transformer"] * len(desired),
+                    strength=[strength for _, strength in desired],
+                    merge_mode="merge",
+                )
+            except Exception:
+                self.shutdown()
+                raise
+            self._active_loras = desired
 
     def _template(self, video_shape: tuple[int, ...]):
         key = tuple(video_shape)
@@ -131,18 +223,22 @@ class H3SGLangRuntime:
         from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
         from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 
-        sampling = SamplingParams.from_user_sampling_params_args(
-            self.generator.server_args.model_path,
-            server_args=self.generator.server_args,
-            prompt="ComfyUI external MiniMax H3 denoiser",
-            task="ref2va",
-            conditions=[
+        is_ref2va = self.model_variant == "ref2va"
+        conditions = []
+        if is_ref2va:
+            conditions.append(
                 {
                     "type": "image",
                     "uri": self._ensure_envelope_image().as_uri(),
                     "role": "reference",
                 }
-            ],
+            )
+        sampling = SamplingParams.from_user_sampling_params_args(
+            self.generator.server_args.model_path,
+            server_args=self.generator.server_args,
+            prompt="ComfyUI external MiniMax H3 denoiser",
+            task="ref2va" if is_ref2va else "t2va",
+            conditions=conditions,
             # SGLang validates transport metadata as a native request. The external
             # worker uses the exact ComfyUI latent shapes carried in external_h3.
             # This valid fixed envelope is scheduler plumbing only.
@@ -174,7 +270,9 @@ class H3SGLangRuntime:
                 [request]
             )
             if output.error:
-                raise RuntimeError(output.error)
+                error = output.error
+                self.shutdown()
+                raise RuntimeError(error)
             return output
 
     def end_execution(
@@ -196,6 +294,7 @@ class H3SGLangRuntime:
             generator = self.generator
             self.generator = None
             self._templates.clear()
+            self._active_loras = ()
         try:
             generator.shutdown()
         except Exception:

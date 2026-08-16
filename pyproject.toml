@@ -1,7 +1,7 @@
 [project]
 name = "h3-sglang-pack"
-version = "0.1.0"
-description = "SGLang-backed ComfyUI nodes for distributed MiniMax H3 Ref2VA denoising."
+version = "1.0.0"
+description = "SGLang-backed ComfyUI nodes for distributed MiniMax H3 video denoising."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
