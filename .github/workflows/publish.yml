@@ -2,11 +2,8 @@ name: Publish to Comfy Registry
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-    paths:
-      - pyproject.toml
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -18,6 +15,22 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v6
+      - name: Verify release tag matches pyproject.toml
+        shell: bash
+        run: |
+          PROJECT_VERSION=$(python - <<'PY'
+          import tomllib
+          with open("pyproject.toml", "rb") as f:
+              print(tomllib.load(f)["project"]["version"])
+          PY
+          )
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "pyproject.toml version: $PROJECT_VERSION"
+          echo "GitHub release version: $TAG_VERSION"
+          if [ "$PROJECT_VERSION" != "$TAG_VERSION" ]; then
+            echo "Version mismatch!"
+            exit 1
+          fi
       - name: Set up Python
         uses: actions/setup-python@v6
         with:

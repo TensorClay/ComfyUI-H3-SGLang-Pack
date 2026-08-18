@@ -1,7 +1,7 @@
 [project]
 name = "h3-sglang-pack"
-version = "1.0.0"
-description = "SGLang-backed ComfyUI nodes for distributed MiniMax H3 video denoising."
+version = "1.0.1"
+description = "Add proper multi-GPU support to your MiniMax H3 workflows with these drop-in replacements for common nodes, that unlock parallel processing via SGLang."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
@@ -23,4 +23,5 @@ Documentation = "https://github.com/TensorClay/ComfyUI-H3-SGLang-Pack#readme"
 [tool.comfy]
 PublisherId = "tensorclay"
 DisplayName = "H3 SGLang Pack"
+Icon = "https://avatars.githubusercontent.com/u/317162298?s=400&v=4"
 requires-comfyui = ">=0.32.0"
