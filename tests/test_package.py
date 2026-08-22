@@ -51,6 +51,7 @@ class PackageTests(unittest.TestCase):
         cls.topology = sys.modules[f"{PACKAGE_NAME}.runtime.topology"]
         cls.model = sys.modules[f"{PACKAGE_NAME}.runtime.model"]
         cls.manager = sys.modules[f"{PACKAGE_NAME}.runtime.manager"]
+        cls.nodes = sys.modules[f"{PACKAGE_NAME}.nodes"]
         cls.catalog = sys.modules[f"{PACKAGE_NAME}.model_catalog"]
         cls.protocol = sys.modules[f"{PACKAGE_NAME}.runtime.protocol"]
         cls.attention = sys.modules[f"{PACKAGE_NAME}.runtime.attention"]
@@ -76,6 +77,8 @@ class PackageTests(unittest.TestCase):
         )
         self.assertNotIn("performance_mode", required)
         self.assertNotIn("attention_backend", required)
+        self.assertEqual(required["hybrid_mode"][0], ["ref2va", "fl2va"])
+        self.assertEqual(required["hybrid_mode"][1]["default"], "ref2va")
 
     def test_attention_nodes_match_the_upstream_contracts(self):
         sage = self.package.NODE_CLASS_MAPPINGS[
@@ -393,8 +396,58 @@ class PackageTests(unittest.TestCase):
             ),
             "ref2va",
         )
+        self.assertEqual(
+            self.catalog._variant_from_path(
+                Path("minimax_h3_hybrid_pruned_bf16.safetensors")
+            ),
+            "hybrid",
+        )
         with self.assertRaisesRegex(ValueError, "filename must identify"):
             self.catalog._variant_from_path(Path("minimax_h3.safetensors"))
+
+    def test_pruned_bf16_is_a_supported_checkpoint_format(self):
+        self.assertIn(
+            self.catalog.COMFY_PRUNED_BF16,
+            self.catalog.SUPPORTED_FORMATS,
+        )
+
+    def test_hybrid_mode_selects_the_runtime_variant(self):
+        checkpoint = mock.Mock()
+        checkpoint.name = "minimax_h3_hybrid_pruned_bf16.safetensors"
+        checkpoint.path = Path("/models/minimax_h3_hybrid_pruned_bf16.safetensors")
+        checkpoint.format = "comfy_bf16"
+        checkpoint.size = 123
+        checkpoint.mtime_ns = 456
+        checkpoint.variant = "hybrid"
+        checkpoint.parameter_keys = ("blocks.0.weight",)
+
+        with mock.patch.object(
+            self.nodes,
+            "inspect_checkpoint",
+            return_value=checkpoint,
+        ):
+            ref_key = self.nodes._key(
+                checkpoint.name,
+                "TP1 / Ulysses1",
+                "ref2va",
+            )
+            fl_key = self.nodes._key(
+                checkpoint.name,
+                "TP1 / Ulysses1",
+                "fl2va",
+            )
+
+        self.assertEqual(ref_key.model_variant, "ref2va")
+        self.assertEqual(fl_key.model_variant, "fl2va")
+        self.assertNotEqual(ref_key, fl_key)
+
+    def test_invalid_hybrid_mode_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "hybrid mode"):
+            self.nodes._key(
+                "minimax_h3_hybrid_pruned_bf16.safetensors",
+                "TP1 / Ulysses1",
+                "t2va",
+            )
 
     def test_keyframes_are_lowered_to_sglang_first_last_signatures(self):
         self.assertEqual(

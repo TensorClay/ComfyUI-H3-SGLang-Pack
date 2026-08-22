@@ -74,8 +74,9 @@ A drop-in replacement for **Load Diffusion Model** in Comfy-Org’s official [te
 
 | Parameter | Description |
 |---|---|
-| `model_name` | A compatible H3 `.safetensors` checkpoint in `ComfyUI/models/diffusion_models`. Full BF16 and ComfyUI pruned INT8 ConvRot FL2VA and Ref2VA exports are supported. The filename must contain `fl2va` or `ref2va`. |
+| `model_name` | A compatible H3 `.safetensors` checkpoint in `ComfyUI/models/diffusion_models`. Full BF16, pruned BF16, and ComfyUI pruned INT8 ConvRot FL2VA, Ref2VA, and hybrid exports are supported. The filename must contain `fl2va`, `ref2va`, or `hybrid`. |
 | `topology` | A compatible TP/Ulysses layout using some or all accelerators visible to ComfyUI. Options are generated from the current device count and H3’s sharding constraints. |
+| `hybrid_mode` | Appears only for a checkpoint whose filename contains `hybrid`. Select `ref2va` or `fl2va` to tell SGLang which model path to initialize and warm up. |
 
 Choose the FL2VA checkpoint for text-to-video and first/last-frame image-to-video. Choose the Ref2VA checkpoint for image, video, and audio references. Connect the loader’s `MODEL` output where the stock loader was connected; the rest of the official graph can remain unchanged.
 

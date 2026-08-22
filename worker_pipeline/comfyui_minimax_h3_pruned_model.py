@@ -131,12 +131,13 @@ def _dequantize_convrot(
 
 
 class ComfyPrunedMiniMaxH3DiTModel(MiniMaxH3DiTModel):
-    """SGLang H3 model adapted to ComfyUI's pruned INT8 ConvRot export.
+    """SGLang H3 model adapted to ComfyUI's pruned H3 exports.
 
+    The pruned BF16 layout is loaded directly. For INT8 ConvRot checkpoints,
     ConvRot weights are restored once while streaming the checkpoint, then
     loaded into SGLang's ordinary TP-sharded BF16 linears. This prioritizes
-    compatibility with the already-installed checkpoint; it intentionally does
-    not claim native Comfy Kitchen W8A8 execution inside SGLang.
+    compatibility with the already-installed checkpoint; it intentionally
+    does not claim native Comfy Kitchen W8A8 execution inside SGLang.
     """
 
     handles_checkpoint_quantization = True
