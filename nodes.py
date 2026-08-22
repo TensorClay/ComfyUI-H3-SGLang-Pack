@@ -8,15 +8,25 @@ from .runtime.model import SGLangH3ModelPatcher
 from .runtime.topology import default_topology, topology_choices
 
 
-def _key(model_name: str, topology: str) -> RuntimeKey:
+HYBRID_MODES = ["ref2va", "fl2va"]
+
+
+def _key(model_name: str, topology: str, hybrid_mode: str) -> RuntimeKey:
+    if hybrid_mode not in HYBRID_MODES:
+        raise ValueError(
+            f"unsupported MiniMax H3 hybrid mode: {hybrid_mode!r}"
+        )
     checkpoint = inspect_checkpoint(model_name)
+    model_variant = (
+        hybrid_mode if checkpoint.variant == "hybrid" else checkpoint.variant
+    )
     return RuntimeKey(
         model_name=checkpoint.name,
         checkpoint_path=str(checkpoint.path),
         checkpoint_format=checkpoint.format,
         checkpoint_size=checkpoint.size,
         checkpoint_mtime_ns=checkpoint.mtime_ns,
-        model_variant=checkpoint.variant,
+        model_variant=model_variant,
         topology=topology,
         parameter_keys=checkpoint.parameter_keys,
     )
@@ -35,6 +45,17 @@ class LoadMiniMaxH3DiffusionModelSGLang:
                     choices,
                     {"default": default_topology()},
                 ),
+                "hybrid_mode": (
+                    HYBRID_MODES,
+                    {
+                        "default": "ref2va",
+                        "tooltip": (
+                            "Select how SGLang should initialize a hybrid "
+                            "checkpoint. This control is shown only when the "
+                            "selected filename identifies a hybrid model."
+                        ),
+                    },
+                ),
             }
         }
 
@@ -47,8 +68,13 @@ class LoadMiniMaxH3DiffusionModelSGLang:
         "MODEL contract and distributes denoiser evaluation through SGLang."
     )
 
-    def load_model(self, model_name: str, topology: str):
-        bundle = RUNTIME_MANAGER.get(_key(model_name, topology))
+    def load_model(
+        self,
+        model_name: str,
+        topology: str,
+        hybrid_mode: str = "ref2va",
+    ):
+        bundle = RUNTIME_MANAGER.get(_key(model_name, topology, hybrid_mode))
         return (bundle.model,)
 
 

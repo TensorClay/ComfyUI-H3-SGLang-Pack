@@ -18,15 +18,24 @@ H3_SIGNATURE_KEYS = frozenset(
     }
 )
 COMFY_INT8_CONVROT = "comfy_int8_convrot"
+COMFY_PRUNED_BF16 = "comfy_pruned_bf16"
 COMFY_BF16 = "comfy_bf16"
-SUPPORTED_FORMATS = frozenset({COMFY_INT8_CONVROT, COMFY_BF16})
-SUPPORTED_VARIANTS = frozenset({"fl2va", "ref2va"})
+SUPPORTED_FORMATS = frozenset(
+    {COMFY_INT8_CONVROT, COMFY_PRUNED_BF16, COMFY_BF16}
+)
+SUPPORTED_VARIANTS = frozenset({"fl2va", "ref2va", "hybrid"})
 
 FULL_BF16_SIGNATURE = {
     "time_embedder.proj_in.weight": ((5376, 256), "F32"),
     "time_embedder.proj_out.weight": ((2688, 5376), "F32"),
     "blocks.0.adaln_proj.linear.weight": ((96768, 2688), "BF16"),
     "final_layer.adaln_proj.linear.weight": ((10752, 2688), "BF16"),
+}
+
+PRUNED_BF16_SIGNATURE = {
+    "adaln_t_table": ((1025, 8), "F32"),
+    "blocks.0.adaln_proj.linear.weight": ((96768, 8), "F16"),
+    "final_layer.adaln_proj.linear.weight": ((10752, 8), "F16"),
 }
 
 
@@ -53,7 +62,7 @@ def _variant_from_path(path: Path) -> str:
     if len(matches) != 1:
         raise ValueError(
             "MiniMax H3 checkpoint filename must identify exactly one model "
-            "variant: fl2va or ref2va"
+            "variant: fl2va, ref2va, or hybrid"
         )
     return matches[0]
 
@@ -100,12 +109,16 @@ def _inspect_cached(
             checkpoint_format = COMFY_INT8_CONVROT
         else:
             if "adaln_t_table" in keys:
-                raise ValueError(
-                    "pruned non-INT8 MiniMax H3 checkpoints are not yet supported"
-                )
-            for name, (expected_shape, expected_dtype) in FULL_BF16_SIGNATURE.items():
+                signature = PRUNED_BF16_SIGNATURE
+                checkpoint_format = COMFY_PRUNED_BF16
+            else:
+                signature = FULL_BF16_SIGNATURE
+                checkpoint_format = COMFY_BF16
+            for name, (expected_shape, expected_dtype) in signature.items():
                 if name not in keys:
-                    raise ValueError(f"full MiniMax H3 checkpoint is missing {name}")
+                    raise ValueError(
+                        f"MiniMax H3 checkpoint is missing {name}"
+                    )
                 tensor = checkpoint.get_slice(name)
                 actual_shape = tuple(tensor.get_shape())
                 if actual_shape != expected_shape:
@@ -115,7 +128,6 @@ def _inspect_cached(
                     )
                 if tensor.get_dtype() != expected_dtype:
                     raise ValueError(f"{name} is not {expected_dtype}")
-            checkpoint_format = COMFY_BF16
 
     parameter_keys = tuple(
         sorted(
