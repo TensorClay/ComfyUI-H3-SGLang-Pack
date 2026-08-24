@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from copy import deepcopy
-import json
+import os
 from typing import Iterable
 
 import torch
 import torch.nn as nn
 
-from comfy_kitchen.tensor.int8 import TensorWiseINT8Layout
+from safetensors import safe_open
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -17,10 +17,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3Attention,
 )
 
-
-CURVE_GRID = 1025
-CURVE_WIDTH = 8
-CONVROT_GROUP_SIZE = 256
+from .comfyui_quantized_weights import QuantizedWeightRestorer
 
 
 class _CurveCoordinates(torch.Tensor):
@@ -55,11 +52,11 @@ class _CurveCoordinates(torch.Tensor):
 
 
 class _CurveTimeEmbedder(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, grid_size: int, width: int) -> None:
         super().__init__()
         self.register_buffer(
             "table",
-            torch.empty((CURVE_GRID, CURVE_WIDTH), dtype=torch.float32),
+            torch.empty((grid_size, width), dtype=torch.float32),
         )
 
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
@@ -99,74 +96,69 @@ def _restore_contiguous_qkv_loader(attention: MiniMaxH3Attention) -> None:
         weight.weight_loader = loader
 
 
-def _decode_quant_metadata(value: torch.Tensor, name: str) -> dict:
-    try:
-        metadata = json.loads(bytes(value.tolist()).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"invalid ComfyUI quantization metadata: {name}") from error
-    expected = {
-        "format": "int8_tensorwise",
-        "convrot": True,
-        "convrot_groupsize": CONVROT_GROUP_SIZE,
-    }
-    if metadata != expected:
-        raise ValueError(
-            f"unsupported ComfyUI quantization metadata for {name}: {metadata}"
-        )
-    return metadata
+def _checkpoint_path() -> str:
+    path = os.environ.get("COMFYUI_SGLANG_H3_CHECKPOINT_PATH")
+    if not path:
+        raise RuntimeError("MiniMax H3 checkpoint path was not provided to worker")
+    return path
 
 
-def _dequantize_convrot(
-    weight: torch.Tensor, scale: torch.Tensor
-) -> torch.Tensor:
-    params = TensorWiseINT8Layout.Params(
-        scale=scale,
-        orig_dtype=torch.bfloat16,
-        orig_shape=tuple(weight.shape),
-        is_weight=True,
-        convrot=True,
-        convrot_groupsize=CONVROT_GROUP_SIZE,
+def _curve_shape() -> tuple[int, int]:
+    with safe_open(_checkpoint_path(), framework="pt", device="cpu") as checkpoint:
+        shape = tuple(checkpoint.get_slice("adaln_t_table").get_shape())
+    if len(shape) != 2 or min(shape) <= 1:
+        raise ValueError(f"invalid MiniMax H3 AdaLN curve shape: {shape}")
+    return shape
+
+
+def _configure_comfy_checkpoint(model: MiniMaxH3DiTModel) -> None:
+    # MiniMax's original checkpoint interleaves Q/K/V rows per head, while
+    # ComfyUI's H3 conversion stores fused Q/K/V contiguously. Avoid applying
+    # SGLang's upstream reorder to an already-converted checkpoint.
+    for module in model.modules():
+        if isinstance(module, MiniMaxH3Attention):
+            _restore_contiguous_qkv_loader(module)
+
+
+def _target_parameter(model: MiniMaxH3DiTModel, name: str):
+    parameter = model.get_parameter(name)
+    return tuple(parameter.shape), parameter.dtype
+
+
+def _restore_quantized_weights(
+    model: MiniMaxH3DiTModel,
+    weights: Iterable[tuple[str, torch.Tensor]],
+):
+    restorer = QuantizedWeightRestorer(
+        _checkpoint_path(),
+        lambda name: _target_parameter(model, name),
     )
-    return TensorWiseINT8Layout.dequantize(weight, params)
+    yield from restorer.iter_restored(weights)
 
 
 class ComfyPrunedMiniMaxH3DiTModel(MiniMaxH3DiTModel):
-    """SGLang H3 model adapted to ComfyUI's pruned INT8 ConvRot export.
-
-    ConvRot weights are restored once while streaming the checkpoint, then
-    loaded into SGLang's ordinary TP-sharded BF16 linears. This prioritizes
-    compatibility with the already-installed checkpoint; it intentionally does
-    not claim native Comfy Kitchen W8A8 execution inside SGLang.
-    """
+    """Load reduced-AdaLN H3 checkpoints in formats supported by ComfyUI."""
 
     handles_checkpoint_quantization = True
 
     def __init__(self, config, hf_config, quant_config=None) -> None:
         if quant_config is not None:
             raise ValueError("Comfy H3 checkpoint adapter does not accept quant_config")
+        curve_grid, curve_width = _curve_shape()
         config = deepcopy(config)
-        config.arch_config.time_embed_dim = CURVE_WIDTH
+        config.arch_config.time_embed_dim = curve_width
         super().__init__(config=config, hf_config=hf_config, quant_config=None)
+        _configure_comfy_checkpoint(self)
 
-        # MiniMax's original checkpoint interleaves Q/K/V rows per head, and
-        # SGLang normally reorders that layout while loading. Comfy-Org's
-        # export has already converted every fused QKV tensor to contiguous
-        # [q_all, k_all, v_all], matching ComfyUI's forward. Restore the base
-        # merged-column loader so each logical matrix is only TP-sharded, not
-        # reordered a second time. This includes token-refiner attention.
-        for module in self.modules():
-            if isinstance(module, MiniMaxH3Attention):
-                _restore_contiguous_qkv_loader(module)
-
-        self.time_embedder = _CurveTimeEmbedder()
+        self.time_embedder = _CurveTimeEmbedder(curve_grid, curve_width)
         for index, block in enumerate(self.blocks):
             block.adaln_proj.linear = _fp32_adaln_linear(
-                input_size=CURVE_WIDTH,
+                input_size=curve_width,
                 output_size=self.arch.adaln_out_features,
                 prefix=f"blocks.{index}.adaln_proj.linear",
             )
         self.final_layer.adaln_proj.linear = _fp32_adaln_linear(
-            input_size=CURVE_WIDTH,
+            input_size=curve_width,
             output_size=self.arch.final_adaln_out_features,
             prefix="final_layer.adaln_proj.linear",
         )
@@ -175,59 +167,11 @@ class ComfyPrunedMiniMaxH3DiTModel(MiniMaxH3DiTModel):
     def preprocess_loaded_state_dict(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ):
-        quantized_names: set[str] = set()
-        pending_weights: dict[str, torch.Tensor] = {}
-        pending_scales: dict[str, torch.Tensor] = {}
-
-        def restored_weight(name: str):
-            if (
-                name not in quantized_names
-                or name not in pending_weights
-                or name not in pending_scales
-            ):
-                return None
-            weight = pending_weights.pop(name)
-            scale = pending_scales.pop(name)
-            quantized_names.remove(name)
-            return name, _dequantize_convrot(weight, scale)
-
-
-        for name, value in weights:
-            if name.endswith(".comfy_quant"):
-                _decode_quant_metadata(value, name)
-                weight_name = name.removesuffix(".comfy_quant") + ".weight"
-                quantized_names.add(weight_name)
-                restored = restored_weight(weight_name)
-                if restored is not None:
-                    yield restored
-                continue
-
-            if name.endswith(".weight_scale"):
-                weight_name = name.removesuffix("_scale")
-                pending_scales[weight_name] = value
-                restored = restored_weight(weight_name)
-                if restored is not None:
-                    yield restored
-                continue
-
-            if value.dtype is torch.int8:
-                pending_weights[name] = value
-                restored = restored_weight(name)
-                if restored is not None:
-                    yield restored
-                continue
-
+        for name, value in _restore_quantized_weights(self, weights):
             if name == "adaln_t_table":
                 yield "time_embedder.table", value
             else:
                 yield name, value
-
-        if pending_weights or pending_scales or quantized_names:
-            unresolved = set(pending_weights) | set(pending_scales) | quantized_names
-            raise ValueError(
-                "incomplete INT8 ConvRot tensor groups: "
-                + ", ".join(sorted(unresolved)[:8])
-            )
 
     def post_load_weights(self) -> None:
         required_fp32 = (
@@ -254,16 +198,21 @@ class ComfyPrunedMiniMaxH3DiTModel(MiniMaxH3DiTModel):
             raise ValueError("rope.inv_freq must stay fp32")
 
 
-class ComfyBF16MiniMaxH3DiTModel(MiniMaxH3DiTModel):
-    """Load Comfy-Org's full BF16 export with its contiguous Q/K/V rows."""
+class ComfyFullMiniMaxH3DiTModel(MiniMaxH3DiTModel):
+    """Load full-AdaLN H3 checkpoints in formats supported by ComfyUI."""
+
+    handles_checkpoint_quantization = True
 
     def __init__(self, config, hf_config, quant_config=None) -> None:
         if quant_config is not None:
-            raise ValueError("Comfy H3 BF16 checkpoint does not accept quant_config")
+            raise ValueError("Comfy H3 checkpoint adapter does not accept quant_config")
         super().__init__(config=config, hf_config=hf_config, quant_config=None)
-        for module in self.modules():
-            if isinstance(module, MiniMaxH3Attention):
-                _restore_contiguous_qkv_loader(module)
+        _configure_comfy_checkpoint(self)
+
+    def preprocess_loaded_state_dict(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ):
+        yield from _restore_quantized_weights(self, weights)
 
 
-__all__ = ["ComfyBF16MiniMaxH3DiTModel", "ComfyPrunedMiniMaxH3DiTModel"]
+__all__ = ["ComfyFullMiniMaxH3DiTModel", "ComfyPrunedMiniMaxH3DiTModel"]

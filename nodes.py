@@ -2,21 +2,31 @@ from __future__ import annotations
 
 import folder_paths
 
-from .model_catalog import inspect_checkpoint, model_choices
+from .model_catalog import (
+    SUPPORTED_VARIANTS,
+    inspect_checkpoint,
+    model_choices,
+)
 from .runtime.manager import RUNTIME_MANAGER, RuntimeKey
 from .runtime.model import SGLangH3ModelPatcher
 from .runtime.topology import default_topology, topology_choices
 
 
-def _key(model_name: str, topology: str) -> RuntimeKey:
+MODEL_VARIANT_CHOICES = list(SUPPORTED_VARIANTS)
+
+
+def _key(model_name: str, topology: str, model_variant: str) -> RuntimeKey:
+    if model_variant not in SUPPORTED_VARIANTS:
+        raise ValueError(f"unsupported MiniMax H3 model variant: {model_variant!r}")
     checkpoint = inspect_checkpoint(model_name)
     return RuntimeKey(
         model_name=checkpoint.name,
         checkpoint_path=str(checkpoint.path),
-        checkpoint_format=checkpoint.format,
+        checkpoint_architecture=checkpoint.architecture,
         checkpoint_size=checkpoint.size,
+        checkpoint_restored_size=checkpoint.restored_size,
         checkpoint_mtime_ns=checkpoint.mtime_ns,
-        model_variant=checkpoint.variant,
+        model_variant=model_variant,
         topology=topology,
         parameter_keys=checkpoint.parameter_keys,
     )
@@ -35,6 +45,18 @@ class LoadMiniMaxH3DiffusionModelSGLang:
                     choices,
                     {"default": default_topology()},
                 ),
+                "model_variant": (
+                    MODEL_VARIANT_CHOICES,
+                    {
+                        "default": "fl2va",
+                        "tooltip": (
+                            "How to use these weights: FL2VA covers text-to-video "
+                            "and first/last-frame generation; Ref2VA covers image, "
+                            "video, and audio references. Checkpoint filenames are "
+                            "not used to infer this selection."
+                        ),
+                    },
+                ),
             }
         }
 
@@ -47,8 +69,13 @@ class LoadMiniMaxH3DiffusionModelSGLang:
         "MODEL contract and distributes denoiser evaluation through SGLang."
     )
 
-    def load_model(self, model_name: str, topology: str):
-        bundle = RUNTIME_MANAGER.get(_key(model_name, topology))
+    def load_model(
+        self,
+        model_name: str,
+        topology: str,
+        model_variant: str,
+    ):
+        bundle = RUNTIME_MANAGER.get(_key(model_name, topology, model_variant))
         return (bundle.model,)
 
 

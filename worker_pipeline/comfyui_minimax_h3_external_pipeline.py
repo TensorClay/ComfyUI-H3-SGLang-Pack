@@ -43,20 +43,22 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
 def register_checkpoint_model() -> None:
-    checkpoint_format = os.environ.get("COMFYUI_SGLANG_H3_CHECKPOINT_FORMAT")
-    if checkpoint_format not in {"comfy_int8_convrot", "comfy_bf16"}:
+    checkpoint_architecture = os.environ.get(
+        "COMFYUI_SGLANG_H3_CHECKPOINT_ARCHITECTURE"
+    )
+    if checkpoint_architecture not in {"full", "pruned_adaln"}:
         return
     from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 
     from .comfyui_minimax_h3_pruned_model import (
-        ComfyBF16MiniMaxH3DiTModel,
+        ComfyFullMiniMaxH3DiTModel,
         ComfyPrunedMiniMaxH3DiTModel,
     )
 
     model_class = (
         ComfyPrunedMiniMaxH3DiTModel
-        if checkpoint_format == "comfy_int8_convrot"
-        else ComfyBF16MiniMaxH3DiTModel
+        if checkpoint_architecture == "pruned_adaln"
+        else ComfyFullMiniMaxH3DiTModel
     )
     ModelRegistry.register_model("MiniMaxH3DiTModel", model_class)
 

@@ -20,8 +20,9 @@ BASE_MODEL_PATH = str(Path(__file__).resolve().parents[1] / "runtime_config")
 class RuntimeKey:
     model_name: str
     checkpoint_path: str
-    checkpoint_format: str
+    checkpoint_architecture: str
     checkpoint_size: int
+    checkpoint_restored_size: int
     checkpoint_mtime_ns: int
     model_variant: str
     topology: str
@@ -58,7 +59,7 @@ class RuntimeManager:
             runtime = H3SGLangRuntime(
                 model_path=BASE_MODEL_PATH,
                 transformer_weights_path=key.checkpoint_path,
-                checkpoint_format=key.checkpoint_format,
+                checkpoint_architecture=key.checkpoint_architecture,
                 model_variant=key.model_variant,
                 tp_size=tp_size,
                 ulysses_degree=ulysses_degree,
@@ -70,7 +71,7 @@ class RuntimeManager:
                     executor,
                     runtime,
                     self.release,
-                    (key.checkpoint_size + tp_size - 1) // tp_size,
+                    (key.checkpoint_restored_size + tp_size - 1) // tp_size,
                 )
             except BaseException:
                 runtime.shutdown()
