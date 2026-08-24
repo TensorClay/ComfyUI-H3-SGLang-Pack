@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import importlib.util
 import json
+import inspect
+import os
 from pathlib import Path
 import sys
+import tempfile
+from types import ModuleType
 import unittest
 from unittest import mock
 
 import torch
+from safetensors.torch import save_file
 
 from comfy.patcher_extension import CallbacksMP
 
@@ -52,6 +58,9 @@ class PackageTests(unittest.TestCase):
         cls.model = sys.modules[f"{PACKAGE_NAME}.runtime.model"]
         cls.manager = sys.modules[f"{PACKAGE_NAME}.runtime.manager"]
         cls.catalog = sys.modules[f"{PACKAGE_NAME}.model_catalog"]
+        cls.quant_bridge = importlib.import_module(
+            f"{PACKAGE_NAME}.worker_pipeline.comfyui_quantized_weights"
+        )
         cls.protocol = sys.modules[f"{PACKAGE_NAME}.runtime.protocol"]
         cls.attention = sys.modules[f"{PACKAGE_NAME}.runtime.attention"]
         cls.lifecycle = sys.modules[f"{PACKAGE_NAME}.runtime.lifecycle"]
@@ -67,12 +76,34 @@ class PackageTests(unittest.TestCase):
         )
 
     def test_schema_sorts_choices_without_changing_the_preferred_default(self):
-        required = self.loader.INPUT_TYPES()["required"]
+        inputs = self.loader.INPUT_TYPES()
+        required = inputs["required"]
         choices = required["topology"][0]
         self.assertEqual(choices, sorted(choices))
         self.assertEqual(
             required["topology"][1]["default"],
             self.topology.default_topology(),
+        )
+        self.assertEqual(
+            list(required), ["model_name", "topology", "model_variant"]
+        )
+        self.assertNotIn("optional", inputs)
+        self.assertEqual(
+            required["model_variant"][0],
+            ["fl2va", "ref2va"],
+        )
+        self.assertEqual(
+            required["model_variant"][1]["default"], "fl2va"
+        )
+        self.assertIs(
+            inspect.signature(self.loader.load_model)
+            .parameters["model_variant"]
+            .default,
+            inspect.Parameter.empty,
+        )
+        self.assertIn(
+            "filenames are not used",
+            required["model_variant"][1]["tooltip"],
         )
         self.assertNotIn("performance_mode", required)
         self.assertNotIn("attention_backend", required)
@@ -380,21 +411,669 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(fl2va_manifest["_minimax_h3"]["partition"], "fl2va")
         self.assertEqual(fl2va_manifest["_minimax_h3"]["tasks"], ["t2va", "fl2va"])
 
-    def test_checkpoint_variant_is_identified_by_filename(self):
-        self.assertEqual(
-            self.catalog._variant_from_path(
-                Path("minimax_h3_fl2va_bf16.safetensors")
-            ),
-            "fl2va",
+    @staticmethod
+    def _synthetic_h3(pruned=False):
+        tensors = {
+            "video_patch_proj.weight": torch.empty((4, 1)),
+            "audio_patch_proj.weight": torch.empty((4, 1)),
+            "condition_proj.weight": torch.empty((4, 1)),
+            "final_layer.video_out.weight": torch.empty((1, 4)),
+            "final_layer.audio_out.weight": torch.empty((1, 4)),
+            "blocks.0.attn.q_norm.weight": torch.empty((1,)),
+            "blocks.0.attn.k_norm.weight": torch.empty((1,)),
+            "blocks.0.attn.qkv_proj.weight": torch.empty((3, 4)),
+            "blocks.0.attn.out_proj.weight": torch.empty((4, 1)),
+            "blocks.0.mlp.fc1.weight": torch.empty((2, 4)),
+            "blocks.0.mlp.fc2.weight": torch.empty((4, 1)),
+            "rope.inv_freq": torch.empty((1,)),
+        }
+        if pruned:
+            tensors.update(
+                {
+                    "adaln_t_table": torch.empty((5, 2)),
+                    "blocks.0.adaln_proj.linear.weight": torch.empty((4, 2)),
+                    "final_layer.adaln_proj.linear.weight": torch.empty((4, 2)),
+                }
+            )
+        else:
+            tensors.update(
+                {
+                    "time_embedder.proj_in.weight": torch.empty((2, 1)),
+                    "time_embedder.proj_out.weight": torch.empty((3, 2)),
+                    "blocks.0.adaln_proj.linear.weight": torch.empty((4, 3)),
+                    "final_layer.adaln_proj.linear.weight": torch.empty((4, 3)),
+                }
+            )
+        return tensors
+
+    @staticmethod
+    def _synthetic_runtime_config(time_embed_dim=3):
+        return {
+            "hidden_size": 4,
+            "num_layers": 1,
+            "token_refiner_num_layers": 0,
+            "num_attention_heads": 1,
+            "attention_head_dim": 1,
+            "ffn_hidden_size": 1,
+            "latents_dim": 1,
+            "audio_latents_dim": 1,
+            "patch_size": [1, 1, 1],
+            "text_dim": 1,
+            "timestep_input_dim": 1,
+            "time_embed_hidden_size": 2,
+            "time_embed_dim": time_embed_dim,
+            "adaln_out_features": 4,
+            "final_adaln_out_features": 4,
+            "rope_inv_freq_len": 1,
+        }
+
+    def test_checkpoint_architecture_is_structural_and_filename_independent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            full_path = Path(directory) / "anything.safetensors"
+            pruned_path = Path(directory) / "also-anything.safetensors"
+            save_file(self._synthetic_h3(), str(full_path))
+            save_file(self._synthetic_h3(pruned=True), str(pruned_path))
+            folders = mock.Mock()
+            paths = {
+                "anything.safetensors": str(full_path),
+                "also-anything.safetensors": str(pruned_path),
+            }
+            folders.get_full_path_or_raise.side_effect = (
+                lambda category, name: paths[name]
+            )
+            self.catalog._inspect_cached.cache_clear()
+            with (
+                mock.patch.object(
+                    self.catalog, "_folder_paths", return_value=folders
+                ),
+                mock.patch.object(
+                    self.catalog,
+                    "_runtime_architecture_config",
+                    return_value=self._synthetic_runtime_config(),
+                ),
+            ):
+                full = self.catalog.inspect_checkpoint("anything.safetensors")
+                pruned = self.catalog.inspect_checkpoint("also-anything.safetensors")
+
+        self.assertEqual(full.architecture, "full")
+        self.assertEqual(pruned.architecture, "pruned_adaln")
+        self.assertFalse(hasattr(full, "variant"))
+
+    def test_checkpoint_architecture_must_match_the_bundled_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "minimax_h3_fl2va_tiny.safetensors"
+            save_file(self._synthetic_h3(), str(path))
+            stat = path.stat()
+            self.catalog._inspect_cached.cache_clear()
+            with self.assertRaisesRegex(ValueError, "bundled runtime"):
+                self.catalog._inspect_cached(
+                    str(path), stat.st_size, stat.st_mtime_ns
+                )
+
+    def test_checkpoint_block_count_must_match_the_bundled_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "minimax_h3_fl2va_missing_block.safetensors"
+            save_file(self._synthetic_h3(), str(path))
+            stat = path.stat()
+            config = self._synthetic_runtime_config()
+            config["num_layers"] = 2
+            self.catalog._inspect_cached.cache_clear()
+            with (
+                mock.patch.object(
+                    self.catalog,
+                    "_runtime_architecture_config",
+                    return_value=config,
+                ),
+                self.assertRaisesRegex(ValueError, "blocks coverage"),
+            ):
+                self.catalog._inspect_cached(
+                    str(path), stat.st_size, stat.st_mtime_ns
+                )
+
+    def test_real_checkpoint_cold_loads_in_sglang_when_configured(self):
+        checkpoint_value = os.environ.get("H3_SGLANG_INTEGRATION_CHECKPOINT")
+        if not checkpoint_value:
+            self.skipTest("H3_SGLANG_INTEGRATION_CHECKPOINT is not set")
+
+        checkpoint_path = Path(checkpoint_value).expanduser().resolve()
+        if not checkpoint_path.is_file():
+            self.fail(f"integration checkpoint does not exist: {checkpoint_path}")
+        stat = checkpoint_path.stat()
+        architecture, _restored_size, _parameter_keys = (
+            self.catalog._inspect_cached(
+                str(checkpoint_path), stat.st_size, stat.st_mtime_ns
+            )
         )
-        self.assertEqual(
-            self.catalog._variant_from_path(
-                Path("minimax_h3_ref2va_bf16.safetensors")
+        variant = os.environ.get("H3_SGLANG_INTEGRATION_VARIANT")
+        if variant not in self.catalog.SUPPORTED_VARIANTS:
+            self.fail(
+                "H3_SGLANG_INTEGRATION_VARIANT must be set to fl2va or ref2va"
+            )
+        runtime_class = sys.modules[
+            f"{PACKAGE_NAME}.runtime.generator"
+        ].H3SGLangRuntime
+        runtime = runtime_class(
+            model_path=str(PROJECT_ROOT / "runtime_config"),
+            transformer_weights_path=str(checkpoint_path),
+            checkpoint_architecture=architecture,
+            model_variant=variant,
+            tp_size=int(os.environ.get("H3_SGLANG_INTEGRATION_TP", "1")),
+            ulysses_degree=int(
+                os.environ.get("H3_SGLANG_INTEGRATION_ULYSSES", "1")
             ),
+            attention_backend="auto",
+        )
+        try:
+            runtime.start()
+            self.assertTrue(runtime.is_running)
+        finally:
+            runtime.shutdown()
+
+    def test_explicit_variant_is_part_of_the_runtime_key(self):
+        checkpoint = self.catalog.H3Checkpoint(
+            name="minimax_h3_fl2va_hybrid.safetensors",
+            path=Path("/models/minimax_h3_fl2va_hybrid.safetensors"),
+            architecture="full",
+            size=123,
+            restored_size=789,
+            mtime_ns=456,
+            parameter_keys=("blocks.0.attn.qkv_proj.weight",),
+        )
+        with mock.patch.object(
+            self.package.nodes, "inspect_checkpoint", return_value=checkpoint
+        ):
+            fl2va = self.package.nodes._key(
+                checkpoint.name, "TP1 / Ulysses1", "fl2va"
+            )
+            ref2va = self.package.nodes._key(
+                checkpoint.name, "TP1 / Ulysses1", "ref2va"
+            )
+        self.assertNotEqual(fl2va, ref2va)
+        self.assertEqual(fl2va.model_variant, "fl2va")
+        self.assertEqual(ref2va.model_variant, "ref2va")
+        self.assertEqual(fl2va.checkpoint_restored_size, 789)
+        with self.assertRaisesRegex(ValueError, "unsupported.*model variant"):
+            self.package.nodes._key(
+                checkpoint.name, "TP1 / Ulysses1", "hybrid"
+            )
+
+    def test_loader_passes_the_explicit_variant_unchanged(self):
+        bundle = mock.Mock(model=object())
+        with (
+            mock.patch.object(self.package.nodes, "_key", return_value=object()) as key,
+            mock.patch.object(
+                self.package.nodes.RUNTIME_MANAGER, "get", return_value=bundle
+            ),
+        ):
+            result = self.loader().load_model(
+                "misleading_fl2va_hybrid.safetensors",
+                "TP1 / Ulysses1",
+                "ref2va",
+            )
+        key.assert_called_once_with(
+            "misleading_fl2va_hybrid.safetensors",
+            "TP1 / Ulysses1",
             "ref2va",
         )
-        with self.assertRaisesRegex(ValueError, "filename must identify"):
-            self.catalog._variant_from_path(Path("minimax_h3.safetensors"))
+        self.assertIs(result[0], bundle.model)
+
+    def test_w4a8_quantized_group_is_restored_structurally(self):
+        metadata = {
+            "format": "asym_w4a8_int8",
+            "group_size": 16,
+            "convrot_groupsize": 256,
+        }
+        metadata_tensor = torch.tensor(
+            list(json.dumps(metadata).encode("utf-8")), dtype=torch.uint8
+        )
+        tensors = {
+            "layer.comfy_quant": metadata_tensor,
+            "layer.weight": torch.zeros((2, 2), dtype=torch.int8),
+            "layer.weight_codebook": torch.arange(16, dtype=torch.float32),
+            "layer.weight_s_channel": torch.ones((2,), dtype=torch.float32),
+            "layer.weight_s_rel": torch.ones((2, 1), dtype=torch.uint8),
+        }
+        seen = {}
+
+        def restore(state_dict, shape, dtype):
+            seen.update(state_dict)
+            self.assertEqual(shape, (2, 4))
+            self.assertEqual(dtype, torch.bfloat16)
+            return torch.ones(shape, dtype=dtype)
+
+        quant_ops = ModuleType("comfy.quant_ops")
+        quant_ops.QUANT_ALGOS = {"asym_w4a8_int8": {}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "w4a8.safetensors"
+            save_file(tensors, str(path))
+            restorer = self.quant_bridge.QuantizedWeightRestorer(
+                path,
+                # Simulate a TP2 SGLang parameter. Restoration must still use
+                # the checkpoint's global (2, 4) matrix shape.
+                lambda name: ((1, 4), torch.bfloat16),
+                restore=restore,
+            )
+            with mock.patch.dict(sys.modules, {"comfy.quant_ops": quant_ops}):
+                restored = list(restorer.iter_restored(tensors.items()))
+
+        self.assertEqual(restored[0][0], "layer.weight")
+        self.assertEqual(tuple(restored[0][1].shape), (2, 4))
+        self.assertEqual(
+            set(seen),
+            {
+                "weight",
+                "comfy_quant",
+                "weight_codebook",
+                "weight_s_channel",
+                "weight_s_rel",
+            },
+        )
+
+    def test_w4a8_restoration_matches_comfy_kitchen_dequantization(self):
+        try:
+            from comfy.quant_ops import QUANT_ALGOS
+            from comfy_kitchen.tensor import QuantizedTensor
+        except ImportError as error:
+            self.skipTest(str(error))
+        if "asym_w4a8_int8" not in QUANT_ALGOS:
+            self.skipTest("installed ComfyUI does not provide W4A8")
+
+        torch.manual_seed(7)
+        source = torch.randn((16, 256), dtype=torch.bfloat16)
+        quantized = QuantizedTensor.from_float(
+            source,
+            "AsymW4A8Int8Layout",
+            group_size=16,
+            convrot_groupsize=256,
+        )
+        state_dict = quantized.state_dict("weight")
+        state_dict["comfy_quant"] = torch.tensor(
+            list(
+                json.dumps(
+                    {
+                        "format": "asym_w4a8_int8",
+                        "group_size": 16,
+                        "convrot_groupsize": 256,
+                    }
+                ).encode("utf-8")
+            ),
+            dtype=torch.uint8,
+        )
+        restored = self.quant_bridge.restore_weight_with_comfy(
+            state_dict,
+            tuple(source.shape),
+            torch.bfloat16,
+        )
+        self.assertTrue(torch.equal(restored, quantized.dequantize()))
+
+    def test_awq_pre_quant_scale_is_folded_into_restored_weight(self):
+        weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        scale = torch.tensor([0.5, 2.0])
+        restored = self.quant_bridge.fold_pre_quant_scale(weight, scale)
+        self.assertTrue(
+            torch.equal(restored, torch.tensor([[0.5, 4.0], [1.5, 8.0]]))
+        )
+        with self.assertRaisesRegex(ValueError, "cannot be folded"):
+            self.quant_bridge.fold_pre_quant_scale(weight, torch.ones(3))
+
+    def test_generic_bridge_restores_other_core_comfy_quant_layouts(self):
+        try:
+            from comfy.quant_ops import QUANT_ALGOS
+            from comfy_kitchen.tensor import QuantizedTensor
+        except ImportError as error:
+            self.skipTest(str(error))
+
+        cases = (
+            ("float8_e4m3fn", "TensorCoreFP8E4M3Layout", {}, {}),
+            ("float8_e5m2", "TensorCoreFP8E5M2Layout", {}, {}),
+            ("mxfp8", "TensorCoreMXFP8Layout", {}, {}),
+            ("nvfp4", "TensorCoreNVFP4Layout", {}, {}),
+            (
+                "int8_tensorwise",
+                "TensorWiseINT8Layout",
+                {"per_channel": True, "convrot": True},
+                {"convrot": True, "convrot_groupsize": 256},
+            ),
+            ("convrot_w4a4", "TensorCoreConvRotW4A4Layout", {}, {}),
+        )
+        torch.manual_seed(11)
+        source = torch.randn((32, 256), dtype=torch.bfloat16)
+        tested = set()
+        for quant_format, layout, quant_kwargs, metadata_kwargs in cases:
+            if quant_format not in QUANT_ALGOS:
+                continue
+            quantized = QuantizedTensor.from_float(
+                source, layout, **quant_kwargs
+            )
+            metadata = {"format": quant_format, **metadata_kwargs}
+            state_dict = quantized.state_dict("weight")
+            state_dict["comfy_quant"] = torch.tensor(
+                list(json.dumps(metadata).encode("utf-8")),
+                dtype=torch.uint8,
+            )
+            original_shape = self.quant_bridge.checkpoint_weight_shape(
+                metadata, state_dict["weight"]
+            )
+            restored = self.quant_bridge.restore_weight_with_comfy(
+                state_dict,
+                original_shape,
+                torch.bfloat16,
+            )
+            self.assertTrue(
+                torch.equal(restored, quantized.dequantize()),
+                quant_format,
+            )
+            tested.add(quant_format)
+        self.assertTrue(
+            {
+                "float8_e4m3fn",
+                "float8_e5m2",
+                "nvfp4",
+                "int8_tensorwise",
+                "convrot_w4a4",
+            }.issubset(tested)
+        )
+
+    def test_legacy_header_quantization_metadata_is_normalized(self):
+        config = {
+            "format": "int8_tensorwise",
+            "convrot": True,
+            "convrot_groupsize": 256,
+        }
+        tensors = {
+            "layer.weight": torch.zeros((2, 4), dtype=torch.int8),
+            "layer.weight_scale": torch.ones((2, 1)),
+        }
+        quant_ops = ModuleType("comfy.quant_ops")
+        quant_ops.QUANT_ALGOS = {"int8_tensorwise": {}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.safetensors"
+            save_file(
+                tensors,
+                str(path),
+                metadata={
+                    "_quantization_metadata": json.dumps(
+                        {"layers": {"layer": config}}
+                    )
+                },
+            )
+            restorer = self.quant_bridge.QuantizedWeightRestorer(
+                path,
+                lambda name: ((2, 4), torch.bfloat16),
+                restore=lambda state, shape, dtype: torch.ones(shape, dtype=dtype),
+            )
+            with mock.patch.dict(sys.modules, {"comfy.quant_ops": quant_ops}):
+                restored = list(restorer.iter_restored(tensors.items()))
+        self.assertEqual([name for name, _ in restored], ["layer.weight"])
+
+    def test_header_w4a8_is_preflighted_and_restored_as_one_group(self):
+        config = {
+            "format": "asym_w4a8_int8",
+            "group_size": 16,
+            "convrot_groupsize": 256,
+        }
+        tensors = {
+            "layer.weight": torch.zeros((2, 2), dtype=torch.int8),
+            "layer.weight_codebook": torch.arange(16, dtype=torch.float32),
+            "layer.weight_s_channel": torch.ones((2,), dtype=torch.float32),
+            "layer.weight_s_rel": torch.ones((2, 1), dtype=torch.uint8),
+        }
+        quant_ops = ModuleType("comfy.quant_ops")
+        quant_ops.QUANT_ALGOS = {"asym_w4a8_int8": {}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "header-w4a8.safetensors"
+            save_file(
+                tensors,
+                str(path),
+                metadata={
+                    "_quantization_metadata": json.dumps(
+                        {"layers": {"layer": config}}
+                    )
+                },
+            )
+            with mock.patch.dict(sys.modules, {"comfy.quant_ops": quant_ops}):
+                keys, layers = self.quant_bridge.validate_checkpoint_quantization(
+                    path
+                )
+                restorer = self.quant_bridge.QuantizedWeightRestorer(
+                    path,
+                    lambda name: ((1, 4), torch.bfloat16),
+                    restore=lambda state, shape, dtype: torch.ones(
+                        shape, dtype=dtype
+                    ),
+                )
+                restored = list(restorer.iter_restored(tensors.items()))
+        self.assertIn("layer.weight_s_rel", keys)
+        self.assertEqual(layers, {"layer.weight": config})
+        self.assertEqual(tuple(restored[0][1].shape), (2, 4))
+
+    def test_quantization_preflight_rejects_unknown_and_incomplete_formats(self):
+        quant_ops = ModuleType("comfy.quant_ops")
+        quant_ops.QUANT_ALGOS = {
+            "asym_w4a8_int8": {},
+            "float8_e4m3fn": {},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            unknown = directory / "unknown.safetensors"
+            missing = directory / "missing.safetensors"
+            missing_fp8 = directory / "missing-fp8.safetensors"
+            save_file(
+                {
+                    "layer.weight": torch.zeros((2, 2), dtype=torch.int8),
+                    "layer.comfy_quant": torch.tensor(
+                        list(json.dumps({"format": "private_w3"}).encode()),
+                        dtype=torch.uint8,
+                    ),
+                },
+                str(unknown),
+            )
+            save_file(
+                {
+                    "layer.weight": torch.zeros((2, 2), dtype=torch.int8),
+                    "layer.comfy_quant": torch.tensor(
+                        list(
+                            json.dumps(
+                                {"format": "asym_w4a8_int8"}
+                            ).encode()
+                        ),
+                        dtype=torch.uint8,
+                    ),
+                },
+                str(missing),
+            )
+            save_file(
+                {
+                    "layer.weight": torch.zeros((2, 2)),
+                    "layer.comfy_quant": torch.tensor(
+                        list(
+                            json.dumps({"format": "float8_e4m3fn"}).encode()
+                        ),
+                        dtype=torch.uint8,
+                    ),
+                },
+                str(missing_fp8),
+            )
+            with mock.patch.dict(sys.modules, {"comfy.quant_ops": quant_ops}):
+                with self.assertRaisesRegex(ValueError, "private_w3"):
+                    self.quant_bridge.validate_checkpoint_quantization(unknown)
+                with self.assertRaisesRegex(ValueError, "weight_s_rel"):
+                    self.quant_bridge.validate_checkpoint_quantization(missing)
+                with self.assertRaisesRegex(ValueError, "weight_scale"):
+                    self.quant_bridge.validate_checkpoint_quantization(missing_fp8)
+
+    def test_legacy_scaled_fp8_is_rejected_before_model_discovery(self):
+        tensors = self._synthetic_h3()
+        tensors["scaled_fp8"] = torch.ones((1,))
+        tensors["blocks.0.attn.qkv_proj.scale_weight"] = torch.ones((1,))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "minimax_h3_fl2va_scaled_fp8.safetensors"
+            save_file(tensors, str(path))
+            folders = mock.Mock()
+            folders.get_filename_list.return_value = [path.name]
+            folders.get_full_path_or_raise.return_value = str(path)
+            self.catalog._inspect_cached.cache_clear()
+            with mock.patch.object(
+                self.catalog, "_folder_paths", return_value=folders
+            ):
+                self.assertEqual(self.catalog.compatible_model_names(), [])
+                with self.assertRaisesRegex(ValueError, "legacy scaled_fp8"):
+                    self.catalog.inspect_checkpoint(path.name)
+
+    def test_malformed_legacy_quantization_header_is_filtered(self):
+        tensors = self._synthetic_h3()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "minimax_h3_fl2va_bad_header.safetensors"
+            save_file(
+                tensors,
+                str(path),
+                metadata={"_quantization_metadata": json.dumps({})},
+            )
+            folders = mock.Mock()
+            folders.get_filename_list.return_value = [path.name]
+            folders.get_full_path_or_raise.return_value = str(path)
+            self.catalog._inspect_cached.cache_clear()
+            with mock.patch.object(
+                self.catalog, "_folder_paths", return_value=folders
+            ):
+                self.assertEqual(self.catalog.compatible_model_names(), [])
+
+    def test_non_h3_checkpoint_is_rejected_before_quantization_preflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "other_quantized_model.safetensors"
+            save_file(
+                {
+                    "unrelated.weight": torch.zeros((2, 2), dtype=torch.int8),
+                    "unrelated.weight_scale": torch.ones((1,)),
+                },
+                str(path),
+            )
+            folders = mock.Mock()
+            folders.get_filename_list.return_value = [path.name]
+            folders.get_full_path_or_raise.return_value = str(path)
+            self.catalog._inspect_cached.cache_clear()
+            with (
+                mock.patch.object(
+                    self.catalog, "_folder_paths", return_value=folders
+                ),
+                mock.patch.object(
+                    self.catalog, "validate_checkpoint_quantization"
+                ) as validate,
+            ):
+                self.assertEqual(self.catalog.compatible_model_names(), [])
+            validate.assert_not_called()
+
+    def test_catalog_filters_structural_h3_with_unsupported_quantization(self):
+        tensors = self._synthetic_h3(pruned=True)
+        tensors["blocks.0.attn.qkv_proj.weight"] = torch.zeros(
+            (3, 2), dtype=torch.int8
+        )
+        tensors["blocks.0.attn.qkv_proj.comfy_quant"] = torch.tensor(
+            list(json.dumps({"format": "private_w3"}).encode()),
+            dtype=torch.uint8,
+        )
+        quant_ops = ModuleType("comfy.quant_ops")
+        quant_ops.QUANT_ALGOS = {}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "minimax_h3_ref2va_private.safetensors"
+            save_file(tensors, str(path))
+            folders = mock.Mock()
+            folders.get_filename_list.return_value = [path.name]
+            folders.get_full_path_or_raise.return_value = str(path)
+            self.catalog._inspect_cached.cache_clear()
+            with (
+                mock.patch.object(
+                    self.catalog, "_folder_paths", return_value=folders
+                ),
+                mock.patch.dict(sys.modules, {"comfy.quant_ops": quant_ops}),
+            ):
+                self.assertEqual(self.catalog.compatible_model_names(), [])
+                with self.assertRaisesRegex(ValueError, "private_w3"):
+                    self.catalog.inspect_checkpoint(path.name)
+
+    def test_catalog_reports_restored_not_compressed_quantized_size(self):
+        config = {
+            "format": "asym_w4a8_int8",
+            "group_size": 16,
+            "convrot_groupsize": 256,
+        }
+        tensors = self._synthetic_h3(pruned=True)
+        tensors["blocks.0.attn.qkv_proj.weight"] = torch.zeros(
+            (3, 2), dtype=torch.int8
+        )
+        tensors["blocks.0.attn.qkv_proj.weight_s_rel"] = torch.ones(
+            (3, 1), dtype=torch.uint8
+        )
+        quant_ops = ModuleType("comfy.quant_ops")
+        quant_ops.QUANT_ALGOS = {"asym_w4a8_int8": {}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "minimax_h3_ref2va_w4a8.safetensors"
+            save_file(
+                tensors,
+                str(path),
+                metadata={
+                    "_quantization_metadata": json.dumps(
+                        {"layers": {"blocks.0.attn.qkv_proj": config}}
+                    )
+                },
+            )
+            folders = mock.Mock()
+            folders.get_full_path_or_raise.return_value = str(path)
+            self.catalog._inspect_cached.cache_clear()
+            with (
+                mock.patch.object(
+                    self.catalog, "_folder_paths", return_value=folders
+                ),
+                mock.patch.dict(sys.modules, {"comfy.quant_ops": quant_ops}),
+                mock.patch.object(
+                    self.catalog,
+                    "_runtime_architecture_config",
+                    return_value=self._synthetic_runtime_config(),
+                ),
+            ):
+                checkpoint = self.catalog.inspect_checkpoint(path.name)
+        # The non-quantized tensors contain 65 FP32 elements after replacing
+        # QKV; the logical packed QKV matrix is 3x4 BF16.
+        self.assertEqual(checkpoint.restored_size, 65 * 4 + 3 * 4 * 2)
+        self.assertNotIn(
+            "blocks.0.attn.qkv_proj.weight_s_rel", checkpoint.parameter_keys
+        )
+
+    def test_packed_full_architecture_uses_logical_weight_dimensions(self):
+        config = {"format": "nvfp4"}
+        tensors = self._synthetic_h3()
+        tensors["time_embedder.proj_out.weight"] = torch.empty((4, 2))
+        for prefix in (
+            "blocks.0.adaln_proj.linear",
+            "final_layer.adaln_proj.linear",
+        ):
+            tensors[f"{prefix}.weight"] = torch.zeros((4, 2), dtype=torch.uint8)
+            tensors[f"{prefix}.weight_scale"] = torch.ones((1,))
+            tensors[f"{prefix}.weight_scale_2"] = torch.ones((1,))
+            tensors[f"{prefix}.comfy_quant"] = torch.tensor(
+                list(json.dumps(config).encode()), dtype=torch.uint8
+            )
+        quant_ops = ModuleType("comfy.quant_ops")
+        quant_ops.QUANT_ALGOS = {"nvfp4": {}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "minimax_h3_ref2va_nvfp4.safetensors"
+            save_file(tensors, str(path))
+            folders = mock.Mock()
+            folders.get_full_path_or_raise.return_value = str(path)
+            self.catalog._inspect_cached.cache_clear()
+            with (
+                mock.patch.object(
+                    self.catalog, "_folder_paths", return_value=folders
+                ),
+                mock.patch.dict(sys.modules, {"comfy.quant_ops": quant_ops}),
+                mock.patch.object(
+                    self.catalog,
+                    "_runtime_architecture_config",
+                    return_value=self._synthetic_runtime_config(time_embed_dim=4),
+                ),
+            ):
+                checkpoint = self.catalog.inspect_checkpoint(path.name)
+        self.assertEqual(checkpoint.architecture, "full")
 
     def test_keyframes_are_lowered_to_sglang_first_last_signatures(self):
         self.assertEqual(
@@ -914,7 +1593,7 @@ class PackageTests(unittest.TestCase):
         runtime = runtime_class(
             model_path="model",
             transformer_weights_path="weights",
-            checkpoint_format="comfy_bf16",
+            checkpoint_architecture="full",
             model_variant="fl2va",
             tp_size=1,
             ulysses_degree=1,
@@ -948,7 +1627,7 @@ class PackageTests(unittest.TestCase):
         runtime = runtime_class(
             model_path="model",
             transformer_weights_path="weights",
-            checkpoint_format="comfy_bf16",
+            checkpoint_architecture="full",
             model_variant="fl2va",
             tp_size=1,
             ulysses_degree=1,
@@ -973,8 +1652,9 @@ class PackageTests(unittest.TestCase):
         key = self.manager.RuntimeKey(
             model_name="model.safetensors",
             checkpoint_path="model.safetensors",
-            checkpoint_format="comfy_bf16",
+            checkpoint_architecture="full",
             checkpoint_size=101,
+            checkpoint_restored_size=301,
             checkpoint_mtime_ns=0,
             model_variant="ref2va",
             topology="TP2 / Ulysses1",
@@ -998,6 +1678,11 @@ class PackageTests(unittest.TestCase):
                 "create_comfyui_model",
                 return_value=model,
             ) as create_model,
+            mock.patch.object(
+                self.manager,
+                "parse_topology",
+                return_value=(2, 1),
+            ),
         ):
             bundle = manager.get(key)
 
@@ -1006,7 +1691,7 @@ class PackageTests(unittest.TestCase):
             executor,
             runtime,
             manager.release,
-            51,
+            151,
         )
 
     def test_runtime_manager_releases_only_its_active_runtime(self):
@@ -1015,8 +1700,9 @@ class PackageTests(unittest.TestCase):
         key = self.manager.RuntimeKey(
             model_name="model.safetensors",
             checkpoint_path="model.safetensors",
-            checkpoint_format="comfy_bf16",
+            checkpoint_architecture="full",
             checkpoint_size=0,
+            checkpoint_restored_size=0,
             checkpoint_mtime_ns=0,
             model_variant="ref2va",
             topology="TP1 / Ulysses1",
@@ -1031,7 +1717,10 @@ class PackageTests(unittest.TestCase):
         manager.release(active_runtime)
         bundle.close.assert_called_once_with()
         self.assertIs(manager._bundle, bundle)
-        self.assertIs(manager.get(key), bundle)
+        with mock.patch.object(
+            self.manager, "parse_topology", return_value=(1, 1)
+        ):
+            self.assertIs(manager.get(key), bundle)
 
         manager.unload()
         self.assertEqual(bundle.close.call_count, 2)

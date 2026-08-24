@@ -61,7 +61,7 @@ class H3SGLangRuntime:
         *,
         model_path: str,
         transformer_weights_path: str,
-        checkpoint_format: str,
+        checkpoint_architecture: str,
         model_variant: str,
         tp_size: int,
         ulysses_degree: int,
@@ -69,7 +69,7 @@ class H3SGLangRuntime:
     ) -> None:
         self.model_path = model_path
         self.transformer_weights_path = transformer_weights_path
-        self.checkpoint_format = checkpoint_format
+        self.checkpoint_architecture = checkpoint_architecture
         self.model_variant = model_variant
         self.tp_size = tp_size
         self.ulysses_degree = ulysses_degree
@@ -126,8 +126,11 @@ class H3SGLangRuntime:
         with self._lock:
             if self.generator is not None:
                 return
-            os.environ["COMFYUI_SGLANG_H3_CHECKPOINT_FORMAT"] = (
-                self.checkpoint_format
+            os.environ["COMFYUI_SGLANG_H3_CHECKPOINT_ARCHITECTURE"] = (
+                self.checkpoint_architecture
+            )
+            os.environ["COMFYUI_SGLANG_H3_CHECKPOINT_PATH"] = (
+                self.transformer_weights_path
             )
             os.environ["COMFYUI_SGLANG_H3_ATTENTION_BACKEND"] = (
                 self.attention_backend

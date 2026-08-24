@@ -74,12 +74,21 @@ A drop-in replacement for **Load Diffusion Model** in Comfy-Org’s official [te
 
 | Parameter | Description |
 |---|---|
-| `model_name` | A compatible H3 `.safetensors` checkpoint in `ComfyUI/models/diffusion_models`. Full BF16 and ComfyUI pruned INT8 ConvRot FL2VA and Ref2VA exports are supported. The filename must contain `fl2va` or `ref2va`. |
+| `model_name` | A MiniMax H3 `.safetensors` checkpoint in `ComfyUI/models/diffusion_models`. Discovery is based on the checkpoint’s H3 tensor structure, not its filename. Both the full time-embedder architecture and the reduced-AdaLN (`adaln_t_table`) architecture used by pruned releases are supported. |
 | `topology` | A compatible TP/Ulysses layout using some or all accelerators visible to ComfyUI. Options are generated from the current device count and H3’s sharding constraints. |
+| `model_variant` | Explicitly selects `fl2va` or `ref2va` request packing. Checkpoint filenames are never used to infer or override this value. |
 
-Choose the FL2VA checkpoint for text-to-video and first/last-frame image-to-video. Choose the Ref2VA checkpoint for image, video, and audio references. Connect the loader’s `MODEL` output where the stock loader was connected; the rest of the official graph can remain unchanged.
+Choose `fl2va` for text-to-video and first-frame, last-frame, or first-and-last-frame image-to-video. Choose `ref2va` for image, video, audio, or mixed references. Text-to-video is a use of FL2VA request packing, not a third checkpoint partition. `t2va`, `hybrid`, checkpoint architecture, and quantization format are intentionally not `model_variant` choices. A hybrid checkpoint can be loaded in either mode when its author designed it for both.
 
-The first generation starts the local SGLang workers. Consecutive compatible SGLang generations reuse the runtime and loaded checkpoint. Before a queued workflow that does not use this pack’s loader begins, the pack unloads its workers so native ComfyUI models can reclaim their VRAM. Changing the checkpoint or topology also replaces the runtime.
+The validated compatibility set is ordinary floating-point H3 checkpoints, the current pruned ComfyUI INT8 ConvRot exports, and the current pruned asymmetric W4A8 INT8 exports. The restoration bridge delegates registered layouts to the installed ComfyUI/Comfy-Kitchen implementation, so other current mixed layouts may also work, but they are not claimed as release-validated without a real H3 checkpoint test. Both tensor-form quantization metadata and the safetensors `_quantization_metadata` header are normalized to the same per-layer form used by core ComfyUI.
+
+Older `scaled_fp8` sentinel files are rejected rather than loaded without their scale/name conversion; checkpoints that require a third-party loader or a private/nonstandard encoding are also outside the validated boundary. Before showing an H3 checkpoint in the model picker, the loader verifies that its tensor shapes match the bundled runtime, every declared quantization format is registered by the installed ComfyUI, and required weight and sidecar tensors are present.
+
+Quantized weights are restored once through the installed ComfyUI/Comfy-Kitchen layout implementation and then loaded into SGLang’s ordinary TP-sharded compute weights; this is format compatibility, not a promise that SGLang executes the original quantized kernels or retains their reduced checkpoint-memory footprint. ComfyUI memory accounting uses the estimated restored parameter size rather than the compressed file size. During cold start, SGLang 0.5.17 materializes the complete restored state dictionary in each worker before TP sharding, so peak host RAM may temporarily approach one full restored checkpoint per worker, plus the compressed checkpoint pages and process overhead. Size the machine for this peak, especially with W4A8 or other highly compressed files whose restored BF16 representation is much larger.
+
+Format availability follows the capabilities of the installed, supported ComfyUI version. Connect the loader’s `MODEL` output where the stock loader was connected; the rest of the official graph can remain unchanged.
+
+The first generation starts the local SGLang workers. Consecutive compatible SGLang generations reuse the runtime and loaded checkpoint. Before a queued workflow that does not use this pack’s loader begins, the pack unloads its workers so native ComfyUI models can reclaim their VRAM. Changing the checkpoint, explicit model variant, or topology replaces the runtime. The new `model_variant` widget is appended after the original `model_name`, `topology` widget order. When opening an older workflow for the first time, verify the new selection—especially for Ref2VA—then save the workflow.
 
 Under the hood, ComfyUI retains the sampling loop and sends the current H3 latent streams to SGLang for each denoiser evaluation. Prompt encoding, scheduling, VAE decoding, and output encoding remain in ComfyUI. Whole-model ComfyUI diffusion wrappers still execute in the host process around the distributed call. Worker-local ControlNet tensors and arbitrary transformer patch callbacks are not transportable through the standard `MODEL` interface; use the worker-native attention, LoRA, and Cache-DiT adapters supplied by this pack.
 
@@ -153,3 +162,26 @@ Compatibility was validated with `cache-dit` 1.3.0 on the heavy Ref2VA workload 
 | W=4, R=0.24, MC=3 | 31:28.11 | 28:24 | 0.6% slower |
 
 These differences are within normal run-to-run variation and show no measurable Cache-DiT benefit for this tested H3 workload. Other workloads, settings, Cache-DiT releases, and hardware may behave differently.
+
+## Development and validation
+
+The Python suite targets the minimum supported ComfyUI release and must run with ComfyUI on `PYTHONPATH`:
+
+```bash
+PYTHONPATH=/path/to/ComfyUI python tests/run_unit_tests.py
+```
+
+CI uses CPU-only PyTorch. The ordinary suite validates explicit model-variant behavior, structural checkpoint preflight, supported ComfyUI quantization layouts, restored-size accounting, and runtime lifecycle without starting SGLang workers.
+
+Before releasing a checkpoint-compatibility change, run the opt-in cold-load test on the target SGLang/GPU environment with a real checkpoint. The default topology is TP1/Ulysses1; set the topology variables to match the machine. `H3_SGLANG_INTEGRATION_VARIANT` is required and must be `fl2va` or `ref2va`.
+
+```bash
+PYTHONPATH=/path/to/ComfyUI \
+H3_SGLANG_INTEGRATION_CHECKPOINT=/path/to/model.safetensors \
+H3_SGLANG_INTEGRATION_VARIANT=fl2va \
+H3_SGLANG_INTEGRATION_TP=2 \
+H3_SGLANG_INTEGRATION_ULYSSES=4 \
+python tests/run_unit_tests.py
+```
+
+This starts the real SGLang worker pool, waits for the checkpoint to load, asserts that the runtime is live, and shuts it down. Monitor peak host RAM during this run. Full release validation should additionally generate the same short deterministic workflow through both the stock and SGLang loaders and compare its output, because a successful cold load alone cannot prove numerical or visual parity.
